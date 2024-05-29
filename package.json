@@ -57,7 +57,7 @@
     "hubot-telegram": "^0.1.0",
     "lomath": "latest",
     "mysql": "^2.12.0",
-    "mysql2": "^1.1.2",
+    "mysql2": "^3.9.8",
     "ngrok": "^2.2.3",
     "poly-socketio": "^1.1.4",
     "portscanner": "^2.1.1",
