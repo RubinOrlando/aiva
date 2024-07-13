@@ -1,4 +1,4 @@
-FROM ubuntu:16.04
+FROM ubuntu:xenial-20210416
 MAINTAINER Wah Loon Keng <kengzwl@gmail.com>
 
 ENV DEBIAN_FRONTEND noninteractive
