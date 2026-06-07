@@ -747,7 +747,12 @@ PAGE = """<!doctype html>
   .saved .idx { color:#7f8db0; font-variant-numeric:tabular-nums; }
   .saved .fname { font-weight:600; color:#e7eaf3; word-break:break-all; }
   .saved .meta { color:#8ea2cf; font-size:13px; }
-  .saved a { margin-left:auto; color:#7fd0ff; white-space:nowrap; }
+  .saved .actions { margin-left:auto; display:flex; align-items:center; gap:10px; }
+  .saved a { color:#7fd0ff; white-space:nowrap; }
+  .btn-mini { border:0; border-radius:8px; padding:7px 13px; font-size:13px;
+              font-weight:600; cursor:pointer; color:#fff; background:#2e7d5b;
+              white-space:nowrap; }
+  .btn-mini.stop { background:#b5485f; }
   .spin { display:inline-block; width:16px; height:16px; border:3px solid #fff5;
           border-top-color:#fff; border-radius:50%; animation:s .8s linear infinite;
           vertical-align:-3px; }
@@ -769,6 +774,8 @@ PAGE = """<!doctype html>
   </div>
   <section id="savedSection" style="display:none">
     <h2>Saved remixes <span class="count" id="savedCount"></span></h2>
+    <p class="hint">▶ play streams the remix through a built-in Web Audio
+       synthesizer — no plugins or internet needed.</p>
     <ul id="saved" class="saved"></ul>
   </section>
   <div class="col2">
@@ -796,14 +803,24 @@ function renderHistory(history){
   $('#savedSection').style.display = history.length ? 'block' : 'none';
   $('#savedCount').textContent = history.length
     ? '('+history.length+' auto-saved to ./remixes/)' : '';
-  ul.innerHTML = history.map((h,i) =>
-    '<li class="'+(i===0?'fresh':'')+'">'
+  ul.innerHTML = history.map((h,i) => {
+    const isPlaying = playing && playing.file===h.file;
+    return '<li class="'+(i===0?'fresh':'')+'">'
     + '<span class="idx">#'+(history.length-i)+'</span>'
     + '<span><span class="fname">'+esc(h.file)+'</span><br>'
     + '<span class="meta">'+esc(h.time)+' · '+esc(h.key)+' · '
     + h.tracks+' tracks</span></span>'
-    + '<a class="download" href="'+esc(h.url)+'" download>⬇ download</a></li>'
-  ).join('');
+    + '<span class="actions">'
+    + '<button class="btn-mini play'+(isPlaying?' stop':'')+'" data-file="'
+    + esc(h.file)+'">'+(isPlaying?'■ stop':'▶ play')+'</button>'
+    + '<a class="download" href="'+esc(h.url)+'" download>⬇ download</a>'
+    + '</span></li>';
+  }).join('');
+  // Re-bind the playing button reference after a re-render.
+  if(playing){
+    const b = ul.querySelector('.play[data-file="'+CSS.escape(playing.file)+'"]');
+    playing.btn = b || playing.btn;
+  }
 }
 
 async function postJSON(url, body){
@@ -812,6 +829,94 @@ async function postJSON(url, body){
   if(!r.ok) throw new Error(await r.text());
   return r.json();
 }
+
+/* ---- Built-in Web Audio MIDI player (no plugins / no network) ---- */
+let audioCtx = null;
+let playing = null;   // { file, nodes:[], timer, btn }
+
+function stopPlayback(){
+  if(!playing) return;
+  playing.nodes.forEach(n => { try { n.stop(); } catch(e){} });
+  if(playing.timer) clearTimeout(playing.timer);
+  if(playing.btn){ playing.btn.textContent='▶ play'; playing.btn.classList.remove('stop'); }
+  playing = null;
+}
+
+function tone(pit, start, dur, amp, ti, out){
+  const o = audioCtx.createOscillator();
+  o.type = ['triangle','sawtooth','square','sine'][ti % 4];
+  o.frequency.value = 440 * Math.pow(2, (pit-69)/12);
+  const g = audioCtx.createGain();
+  const peak = 0.10 + 0.45*amp, sus = Math.max(0.001, peak*0.55);
+  g.gain.setValueAtTime(0.0001, start);
+  g.gain.linearRampToValueAtTime(peak, start+0.012);
+  g.gain.exponentialRampToValueAtTime(sus, start+Math.min(dur,0.18));
+  g.gain.setValueAtTime(sus, Math.max(start+0.02, start+dur-0.05));
+  g.gain.exponentialRampToValueAtTime(0.0001, start+dur);
+  o.connect(g); g.connect(out);
+  o.start(start); o.stop(start+dur+0.03);
+  return o;
+}
+
+function drum(pit, start, amp, out){
+  if(pit===35 || pit===36){            // kick
+    const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+    o.frequency.setValueAtTime(150, start);
+    o.frequency.exponentialRampToValueAtTime(50, start+0.12);
+    g.gain.setValueAtTime(amp*0.9, start);
+    g.gain.exponentialRampToValueAtTime(0.0001, start+0.18);
+    o.connect(g); g.connect(out); o.start(start); o.stop(start+0.2);
+    return o;
+  }
+  const isHat = pit>=42 && pit<=46;
+  const dur = (pit===42||pit===44)?0.05 : (pit===46?0.3 : 0.16);
+  const buf = audioCtx.createBuffer(1, Math.ceil(audioCtx.sampleRate*dur), audioCtx.sampleRate);
+  const d = buf.getChannelData(0);
+  for(let i=0;i<d.length;i++) d[i] = Math.random()*2-1;
+  const src=audioCtx.createBufferSource(); src.buffer=buf;
+  const f=audioCtx.createBiquadFilter();
+  f.type = isHat ? 'highpass' : 'bandpass';
+  f.frequency.value = isHat ? 8000 : ((pit===38||pit===40)?1800:3000);
+  const g=audioCtx.createGain();
+  g.gain.setValueAtTime(amp*0.6, start);
+  g.gain.exponentialRampToValueAtTime(0.0001, start+dur);
+  src.connect(f); f.connect(g); g.connect(out);
+  src.start(start); src.stop(start+dur);
+  return src;
+}
+
+async function play(file, btn){
+  if(playing && playing.file===file){ stopPlayback(); return; }
+  stopPlayback();
+  let data;
+  try{ data = await (await fetch('/events/'+encodeURIComponent(file))).json(); }
+  catch(e){ setStatus('Could not load remix audio: '+e.message); return; }
+  if(!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  await audioCtx.resume();
+  const secPerTick = (data.tempo/1e6) / data.tpb;
+  const t0 = audioCtx.currentTime + 0.08;
+  const comp = audioCtx.createDynamicsCompressor(); comp.connect(audioCtx.destination);
+  const master = audioCtx.createGain(); master.gain.value = 0.6; master.connect(comp);
+  const nodes = []; let end = t0;
+  data.tracks.forEach((tr, ti) => {
+    tr.notes.forEach(n => {
+      const start = t0 + n[0]*secPerTick;
+      const dur = Math.max(0.05, n[1]*secPerTick);
+      const amp = n[3]/127;
+      nodes.push(tr.is_drum ? drum(n[2], start, amp, master)
+                            : tone(n[2], start, dur, amp, ti, master));
+      end = Math.max(end, start+dur);
+    });
+  });
+  playing = { file, nodes, btn, timer:null };
+  if(btn){ btn.textContent='■ stop'; btn.classList.add('stop'); }
+  playing.timer = setTimeout(stopPlayback, (end - audioCtx.currentTime + 0.4)*1000);
+}
+
+$('#saved').addEventListener('click', e => {
+  const b = e.target.closest('.play');
+  if(b) play(b.dataset.file, b);
+});
 
 $('#analyzeBtn').onclick = async () => {
   const f = $('#file').files[0];
@@ -915,16 +1020,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"history": STUDIO.history}))
         elif path.startswith("/remixes/"):
             self._serve_remix_file(path[len("/remixes/"):])
+        elif path.startswith("/events/"):
+            self._serve_events(path[len("/events/"):])
         else:
             self._send(404, "Not found", "text/plain")
 
-    def _serve_remix_file(self, fname):
-        # Only allow plain filenames (no traversal) that actually live in REMIX_DIR.
+    def _safe_remix_path(self, fname):
+        """Validate a bare remix filename and return its full path, else None."""
         if not fname or "/" in fname or "\\" in fname or ".." in fname:
-            self._send(400, "Bad filename", "text/plain")
-            return
+            return None
         full = os.path.join(REMIX_DIR, fname)
-        if not os.path.isfile(full):
+        return full if os.path.isfile(full) else None
+
+    def _serve_remix_file(self, fname):
+        full = self._safe_remix_path(fname)
+        if full is None:
             self._send(404, "No such remix", "text/plain")
             return
         with open(full, "rb") as fh:
@@ -936,6 +1046,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_events(self, fname):
+        """Return a saved remix as JSON note events for the in-browser player."""
+        full = self._safe_remix_path(fname)
+        if full is None:
+            self._send(404, "No such remix", "text/plain")
+            return
+        with open(full, "rb") as fh:
+            tracks, tpb, tempo = load_tracks(fh.read())
+        out = {"tpb": tpb, "tempo": tempo, "tracks": [
+            {"is_drum": t.is_drum, "program": t.program, "channel": t.channel,
+             "notes": [[n.start, n.dur, n.pitch, n.velocity] for n in t.notes]}
+            for t in tracks
+        ]}
+        self._send(200, json.dumps(out))
 
     def do_POST(self):
         try:
