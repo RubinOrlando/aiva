@@ -12,6 +12,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# MIDI Remix Studio auto-saved output
+remixes/
+remix_demo.mid
+
 # Ruby
 *.gem
 Gemfile.lock

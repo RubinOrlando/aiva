@@ -36,15 +36,21 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import html
 import io
 import json
 import math
+import os
 import random
+import re
 import sys
 import webbrowser
 from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Directory where every generated remix is auto-saved. Created on first use.
+REMIX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "remixes")
 
 try:
     import mido
@@ -733,6 +739,15 @@ PAGE = """<!doctype html>
   .empty-state { color:#7f8db0; padding:30px; text-align:center;
                  border:1px dashed #2c3a5e; border-radius:14px; }
   a.download { color:#7fd0ff; }
+  .saved { list-style:none; margin:0 0 22px; padding:0; display:flex;
+           flex-direction:column; gap:8px; }
+  .saved li { display:flex; align-items:center; gap:12px; background:#141a28;
+              border:1px solid #222a3d; border-radius:10px; padding:10px 14px; }
+  .saved li.fresh { border-color:#bf5bef; }
+  .saved .idx { color:#7f8db0; font-variant-numeric:tabular-nums; }
+  .saved .fname { font-weight:600; color:#e7eaf3; word-break:break-all; }
+  .saved .meta { color:#8ea2cf; font-size:13px; }
+  .saved a { margin-left:auto; color:#7fd0ff; white-space:nowrap; }
   .spin { display:inline-block; width:16px; height:16px; border:3px solid #fff5;
           border-top-color:#fff; border-radius:50%; animation:s .8s linear infinite;
           vertical-align:-3px; }
@@ -751,8 +766,11 @@ PAGE = """<!doctype html>
     <button class="btn btn-remix" id="remixBtn" disabled>🎲 Random Remix</button>
     <span id="status"></span>
     <span class="pill" id="keyPill" style="display:none"></span>
-    <a id="dl" class="download" style="display:none" download="remix.mid">⬇ download remix.mid</a>
   </div>
+  <section id="savedSection" style="display:none">
+    <h2>Saved remixes <span class="count" id="savedCount"></span></h2>
+    <ul id="saved" class="saved"></ul>
+  </section>
   <div class="col2">
     <section>
       <h2>Original probabilities</h2>
@@ -769,6 +787,24 @@ const $ = s => document.querySelector(s);
 let loaded = false;
 
 function setStatus(t, spin){ $('#status').innerHTML = (spin?'<span class=spin></span> ':'')+t; }
+
+function esc(s){ return String(s).replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function renderHistory(history){
+  const ul = $('#saved');
+  $('#savedSection').style.display = history.length ? 'block' : 'none';
+  $('#savedCount').textContent = history.length
+    ? '('+history.length+' auto-saved to ./remixes/)' : '';
+  ul.innerHTML = history.map((h,i) =>
+    '<li class="'+(i===0?'fresh':'')+'">'
+    + '<span class="idx">#'+(history.length-i)+'</span>'
+    + '<span><span class="fname">'+esc(h.file)+'</span><br>'
+    + '<span class="meta">'+esc(h.time)+' · '+esc(h.key)+' · '
+    + h.tracks+' tracks</span></span>'
+    + '<a class="download" href="'+esc(h.url)+'" download>⬇ download</a></li>'
+  ).join('');
+}
 
 async function postJSON(url, body){
   const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
@@ -791,6 +827,7 @@ $('#analyzeBtn').onclick = async () => {
     $('#keyPill').textContent = 'Detected key: '+res.key;
     $('#remixBtn').disabled = false;
     loaded = true;
+    renderHistory(res.history || []);
     setStatus('Analyzed '+res.tracks+' instrument track(s).');
   }catch(e){ setStatus('Error: '+e.message); }
 };
@@ -801,24 +838,50 @@ $('#remixBtn').onclick = async () => {
   try{
     const res = await postJSON('/remix',{});
     $('#remix').innerHTML = res.html;
-    $('#dl').style.display='inline';
-    $('#dl').href = '/download?ts='+Date.now();
+    renderHistory(res.history || []);
     $('#keyPill').textContent = 'Key: '+res.key+' · counterpoint applied';
-    setStatus('Remix ready — '+res.tracks+' track(s).');
+    setStatus('Remix saved as '+res.saved.file+' — '+res.tracks+' track(s).');
   }catch(e){ setStatus('Error: '+e.message); }
 };
 </script>
 </body></html>"""
 
 
+def _safe_stem(name):
+    """Turn an uploaded filename into a safe filename stem."""
+    stem = os.path.splitext(os.path.basename(name or "song"))[0]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "song"
+    return stem[:40]
+
+
+def save_remix(stem, data: bytes):
+    """Write remix bytes to REMIX_DIR under a unique, timestamped filename.
+
+    Returns the bare filename (served later from /remixes/<filename>).
+    """
+    os.makedirs(REMIX_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"{stem}_remix_{ts}"
+    fname = base + ".mid"
+    # Guard against same-second collisions.
+    n = 2
+    while os.path.exists(os.path.join(REMIX_DIR, fname)):
+        fname = f"{base}_{n}.mid"
+        n += 1
+    with open(os.path.join(REMIX_DIR, fname), "wb") as fh:
+        fh.write(data)
+    return fname
+
+
 class Studio:
-    """Holds the currently loaded song + most recent remix (single user)."""
+    """Holds the currently loaded song + the history of saved remixes."""
 
     def __init__(self):
         self.tracks = None
         self.tpb = 480
         self.tempo = 500000
-        self.remix_bytes = None
+        self.source_name = "song"
+        self.history = []  # list of {file, key, tracks, time}
 
 
 STUDIO = Studio()
@@ -845,15 +908,34 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(raw or b"{}")
 
     def do_GET(self):
-        if self.path == "/" or self.path.startswith("/index"):
+        path = self.path.split("?", 1)[0]
+        if path == "/" or path.startswith("/index"):
             self._send(200, PAGE, "text/html; charset=utf-8")
-        elif self.path.startswith("/download"):
-            if STUDIO.remix_bytes:
-                self._send(200, STUDIO.remix_bytes, "audio/midi")
-            else:
-                self._send(404, "No remix yet", "text/plain")
+        elif path == "/history":
+            self._send(200, json.dumps({"history": STUDIO.history}))
+        elif path.startswith("/remixes/"):
+            self._serve_remix_file(path[len("/remixes/"):])
         else:
             self._send(404, "Not found", "text/plain")
+
+    def _serve_remix_file(self, fname):
+        # Only allow plain filenames (no traversal) that actually live in REMIX_DIR.
+        if not fname or "/" in fname or "\\" in fname or ".." in fname:
+            self._send(400, "Bad filename", "text/plain")
+            return
+        full = os.path.join(REMIX_DIR, fname)
+        if not os.path.isfile(full):
+            self._send(404, "No such remix", "text/plain")
+            return
+        with open(full, "rb") as fh:
+            body = fh.read()
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/midi")
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{fname}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         try:
@@ -873,22 +955,35 @@ class Handler(BaseHTTPRequestHandler):
         if not tracks:
             raise ValueError("No note data found in this MIDI file.")
         STUDIO.tracks, STUDIO.tpb, STUDIO.tempo = tracks, tpb, tempo
-        STUDIO.remix_bytes = None
+        STUDIO.source_name = _safe_stem(payload.get("name"))
+        STUDIO.history = []  # fresh remix history for the newly loaded song
         _, _, key = detect_scale(tracks)
         cards = "".join(render_track_card(analyze_track(t, tpb)) for t in tracks)
         self._send(200, json.dumps({"html": cards, "key": key,
-                                    "tracks": len(tracks)}))
+                                    "tracks": len(tracks),
+                                    "history": STUDIO.history}))
 
     def _handle_remix(self):
         if not STUDIO.tracks:
             raise ValueError("Upload and analyze a MIDI file first.")
         new_tracks, key = remix_all(
             STUDIO.tracks, STUDIO.tpb, STUDIO.tempo, seed=random.randrange(1 << 30))
-        STUDIO.remix_bytes = tracks_to_midi(new_tracks, STUDIO.tpb, STUDIO.tempo)
+        data = tracks_to_midi(new_tracks, STUDIO.tpb, STUDIO.tempo)
+        fname = save_remix(STUDIO.source_name, data)
+        entry = {
+            "file": fname,
+            "url": "/remixes/" + fname,
+            "key": key,
+            "tracks": len(new_tracks),
+            "time": datetime.datetime.now().strftime("%H:%M:%S"),
+        }
+        STUDIO.history.insert(0, entry)  # newest first
         cards = "".join(render_track_card(analyze_track(t, STUDIO.tpb))
                         for t in new_tracks)
         self._send(200, json.dumps({"html": cards, "key": key,
-                                    "tracks": len(new_tracks)}))
+                                    "tracks": len(new_tracks),
+                                    "history": STUDIO.history,
+                                    "saved": entry}))
 
 
 def serve(port=8765, open_browser=True):
