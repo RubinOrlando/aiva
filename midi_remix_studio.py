@@ -388,12 +388,18 @@ def weighted_choice(counter: Counter, rng: random.Random):
     return k
 
 
-def remix_melodic(track: Track, stats: dict, rng: random.Random):
+def remix_melodic(track: Track, stats: dict, rng: random.Random, tpb: int = 480):
     """Generate a new melody filling the original span using the Markov
-    pitch chain + duration/velocity histograms."""
+    pitch chain + duration/velocity histograms.
+
+    Sampled durations are snapped to the 16th-note grid so onsets stay
+    metrically aligned — this tightens the groove and gives the counterpoint
+    pass clean beat positions at which to compare voices against the bass.
+    """
     span = track.span or (stats.get("count", 8) * 240)
     origin = min((n.start for n in track.notes), default=0)
     end = origin + span
+    grid = max(1, tpb // 4)  # 16th-note quantization
 
     transitions = stats["_transitions"]
     starts = stats["_starts"] or stats["_pitch_pool"]
@@ -408,6 +414,7 @@ def remix_melodic(track: Track, stats: dict, rng: random.Random):
     while t < end and guard < 4096:
         guard += 1
         dur = weighted_choice(dur_ticks, rng) or 240
+        dur = max(grid, int(round(dur / grid)) * grid)  # quantize to grid
         vel = weighted_choice(vels, rng) or 80
         if t + dur > end:
             dur = max(1, end - t)
@@ -568,7 +575,7 @@ def remix_all(tracks, tpb, tempo, seed=None):
         if tr.is_drum:
             nt = remix_drums(tr, stats, rng)
         else:
-            nt = remix_melodic(tr, stats, rng)
+            nt = remix_melodic(tr, stats, rng, tpb)
             melodic.append(nt)
         new_tracks.append(nt)
 
