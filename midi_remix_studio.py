@@ -769,6 +769,10 @@ PAGE = """<!doctype html>
     <input type="file" id="file" accept=".mid,.midi" class="file">
     <button class="btn btn-primary" id="analyzeBtn">Analyze</button>
     <button class="btn btn-remix" id="remixBtn" disabled>🎲 Random Remix</button>
+    <button class="btn-mini play" id="playOrig" data-file="__source__"
+            style="display:none">▶ play original</button>
+    <a class="download" id="dlOrig" href="/source.mid" download
+       style="display:none">⬇ original</a>
     <span id="status"></span>
     <span class="pill" id="keyPill" style="display:none"></span>
   </div>
@@ -888,9 +892,11 @@ function drum(pit, start, amp, out){
 async function play(file, btn){
   if(playing && playing.file===file){ stopPlayback(); return; }
   stopPlayback();
+  const url = file==='__source__' ? '/source-events'
+                                  : '/events/'+encodeURIComponent(file);
   let data;
-  try{ data = await (await fetch('/events/'+encodeURIComponent(file))).json(); }
-  catch(e){ setStatus('Could not load remix audio: '+e.message); return; }
+  try{ data = await (await fetch(url)).json(); }
+  catch(e){ setStatus('Could not load audio: '+e.message); return; }
   if(!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
   await audioCtx.resume();
   const secPerTick = (data.tempo/1e6) / data.tpb;
@@ -917,6 +923,7 @@ $('#saved').addEventListener('click', e => {
   const b = e.target.closest('.play');
   if(b) play(b.dataset.file, b);
 });
+$('#playOrig').onclick = e => play('__source__', e.currentTarget);
 
 $('#analyzeBtn').onclick = async () => {
   const f = $('#file').files[0];
@@ -931,6 +938,8 @@ $('#analyzeBtn').onclick = async () => {
     $('#keyPill').style.display='inline-block';
     $('#keyPill').textContent = 'Detected key: '+res.key;
     $('#remixBtn').disabled = false;
+    $('#playOrig').style.display='inline-block';
+    $('#dlOrig').style.display='inline';
     loaded = true;
     renderHistory(res.history || []);
     setStatus('Analyzed '+res.tracks+' instrument track(s).');
@@ -978,6 +987,17 @@ def save_remix(stem, data: bytes):
     return fname
 
 
+def events_from_bytes(data: bytes):
+    """Serialize MIDI bytes into the JSON note-event structure the browser
+    player consumes."""
+    tracks, tpb, tempo = load_tracks(data)
+    return {"tpb": tpb, "tempo": tempo, "tracks": [
+        {"is_drum": t.is_drum, "program": t.program, "channel": t.channel,
+         "notes": [[n.start, n.dur, n.pitch, n.velocity] for n in t.notes]}
+        for t in tracks
+    ]}
+
+
 class Studio:
     """Holds the currently loaded song + the history of saved remixes."""
 
@@ -986,6 +1006,7 @@ class Studio:
         self.tpb = 480
         self.tempo = 500000
         self.source_name = "song"
+        self.source_bytes = None  # raw uploaded MIDI, for original playback
         self.history = []  # list of {file, key, tracks, time}
 
 
@@ -1022,6 +1043,22 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_remix_file(path[len("/remixes/"):])
         elif path.startswith("/events/"):
             self._serve_events(path[len("/events/"):])
+        elif path == "/source-events":
+            if STUDIO.source_bytes:
+                self._send(200, json.dumps(events_from_bytes(STUDIO.source_bytes)))
+            else:
+                self._send(404, "No source loaded", "text/plain")
+        elif path == "/source.mid":
+            if STUDIO.source_bytes:
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/midi")
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{STUDIO.source_name}.mid"')
+                self.send_header("Content-Length", str(len(STUDIO.source_bytes)))
+                self.end_headers()
+                self.wfile.write(STUDIO.source_bytes)
+            else:
+                self._send(404, "No source loaded", "text/plain")
         else:
             self._send(404, "Not found", "text/plain")
 
@@ -1054,12 +1091,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "No such remix", "text/plain")
             return
         with open(full, "rb") as fh:
-            tracks, tpb, tempo = load_tracks(fh.read())
-        out = {"tpb": tpb, "tempo": tempo, "tracks": [
-            {"is_drum": t.is_drum, "program": t.program, "channel": t.channel,
-             "notes": [[n.start, n.dur, n.pitch, n.velocity] for n in t.notes]}
-            for t in tracks
-        ]}
+            out = events_from_bytes(fh.read())
         self._send(200, json.dumps(out))
 
     def do_POST(self):
@@ -1081,6 +1113,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("No note data found in this MIDI file.")
         STUDIO.tracks, STUDIO.tpb, STUDIO.tempo = tracks, tpb, tempo
         STUDIO.source_name = _safe_stem(payload.get("name"))
+        STUDIO.source_bytes = data
         STUDIO.history = []  # fresh remix history for the newly loaded song
         _, _, key = detect_scale(tracks)
         cards = "".join(render_track_card(analyze_track(t, tpb)) for t in tracks)
