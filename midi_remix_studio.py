@@ -400,6 +400,18 @@ def remix_melodic(track: Track, stats: dict, rng: random.Random, tpb: int = 480)
     origin = min((n.start for n in track.notes), default=0)
     end = origin + span
     grid = max(1, tpb // 4)  # 16th-note quantization
+    # Keep the remix inside the instrument's original register (small margin)
+    # so the Markov walk can't wander octaves out of its natural range.
+    pitches = [n.pitch for n in track.notes]
+    lo = (min(pitches) - 2) if pitches else 0
+    hi = (max(pitches) + 2) if pitches else 127
+
+    def clamp(p):
+        while p < lo:
+            p += 12
+        while p > hi:
+            p -= 12
+        return max(0, min(127, p))
 
     transitions = stats["_transitions"]
     starts = stats["_starts"] or stats["_pitch_pool"]
@@ -407,7 +419,7 @@ def remix_melodic(track: Track, stats: dict, rng: random.Random, tpb: int = 480)
     dur_ticks = stats["_dur_ticks"]
     vels = stats["_velocities"]
 
-    pitch = weighted_choice(starts, rng) or weighted_choice(pool, rng) or 60
+    pitch = clamp(weighted_choice(starts, rng) or weighted_choice(pool, rng) or 60)
     t = origin
     new_notes = []
     guard = 0
@@ -418,7 +430,7 @@ def remix_melodic(track: Track, stats: dict, rng: random.Random, tpb: int = 480)
         vel = weighted_choice(vels, rng) or 80
         if t + dur > end:
             dur = max(1, end - t)
-        new_notes.append(Note(t, dur, pitch, vel))
+        new_notes.append(Note(t, dur, clamp(pitch), vel))
         t += dur
         nxt = weighted_choice(transitions.get(pitch, Counter()), rng)
         if nxt is None:
